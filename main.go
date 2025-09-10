@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/xml"
 	"fmt"
+	"html"
+	"io"
+	"net/http"
 	"os"
 	"slices"
 	"time"
@@ -28,6 +32,58 @@ type command struct {
 
 type commands struct {
 	handlers map[string]func(*state, command) error
+}
+
+type RSSFeed struct {
+	Channel struct {
+		Title       string    `xml:"title"`
+		Link        string    `xml:"link"`
+		Description string    `xml:"description"`
+		Item        []RSSItem `xml:"item"`
+	} `xml:"channel"`
+}
+
+type RSSItem struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	Description string `xml:"description"`
+	PubDate     string `xml:"pubDate"`
+}
+
+func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
+	client := &http.Client{
+		CheckRedirect: http.DefaultClient.CheckRedirect,
+	}
+
+	req, err := http.NewRequest("GET", feedURL, nil)
+	if err != nil {
+		return &RSSFeed{}, err
+	}
+
+	req.Header.Set("User-Agent", "gator")
+	resp, err := client.Do(req)
+	if err != nil {
+		return &RSSFeed{}, err
+	}
+
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return &RSSFeed{}, err
+	}
+
+	xmldata := RSSFeed{}
+
+	err = xml.Unmarshal(body, &xmldata)
+	if err != nil {
+		return &RSSFeed{}, err
+	}
+
+	xmldata.Channel.Title = html.UnescapeString(xmldata.Channel.Title)
+	xmldata.Channel.Description = html.UnescapeString((xmldata.Channel.Description))
+
+	return &xmldata, nil
 }
 
 func getConfigFilePath() (string, error) {
@@ -103,6 +159,19 @@ func handlerRegister(s *state, cmd command) error {
 	return nil
 }
 
+func handlerAgg(s *state, cmd command) error {
+	feedURL := "https://www.wagslane.dev/index.xml"
+
+	rssFeed, err := fetchFeed(context.Background(), feedURL)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(rssFeed)
+
+	return nil
+}
+
 func handlerReset(s *state, cmd command) error {
 	err := s.db.Reset(context.Background())
 	if err != nil {
@@ -145,6 +214,7 @@ func main() {
 	c.register("register", handlerRegister)
 	c.register("reset", handlerReset)
 	c.register("users", handlerUsers)
+	c.register("agg", handlerAgg)
 
 	cmd := command{
 		name: os.Args[1],
