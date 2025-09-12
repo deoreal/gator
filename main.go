@@ -59,6 +59,7 @@ type RSSItem struct {
 	PubDate     string `xml:"pubDate"`
 }
 
+// fetchFeed reads a RSSfeed from a given url
 func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	client := &http.Client{
 		CheckRedirect: http.DefaultClient.CheckRedirect,
@@ -95,6 +96,32 @@ func fetchFeed(ctx context.Context, feedURL string) (*RSSFeed, error) {
 	return &xmldata, nil
 }
 
+// middlewareLoggedIn used to enrich a handler call with needed information
+func middlewareLoggedIn(handler func(s *state, cmd command, user database.User) error) func(*state, command) error {
+	return func(s *state, cmd command) error {
+		// Check if a user is currently logged in
+		if s.conf.CurrentUserName == "" {
+			return fmt.Errorf("no user is currently logged in")
+		}
+
+		// Get the user ID from the database
+		userID, err := s.db.GetUser(context.Background(), s.conf.CurrentUserName)
+		if err != nil {
+			return fmt.Errorf("couldn't get current user: %w", err)
+		}
+
+		// Get the full user object
+		user, err := s.db.GetUserByID(context.Background(), userID)
+		if err != nil {
+			return fmt.Errorf("couldn't get user details: %w", err)
+		}
+
+		// Call the wrapped handler with the user
+		return handler(s, cmd, user)
+	}
+}
+
+// getConfigFilePath returns the path of the config fiel namt
 func getConfigFilePath() (string, error) {
 	homedir, err := os.UserHomeDir()
 	if err != nil {
@@ -103,6 +130,7 @@ func getConfigFilePath() (string, error) {
 	return homedir + "/" + configFileName, nil
 }
 
+// handlerLogin set a user as current user
 func handlerLogin(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		fmt.Println("username is required")
@@ -133,6 +161,7 @@ func handlerFeeds(s *state, cmd command) error {
 	return nil
 }
 
+// handlerUsers lists the list of registeres users and indicates which is set as the current user
 func handlerUsers(s *state, cmd command) error {
 	users, err := s.db.GetUsers(context.Background())
 	if err != nil {
@@ -149,6 +178,7 @@ func handlerUsers(s *state, cmd command) error {
 	return nil
 }
 
+// handlerRegister registers a new user by adding him to the database and setting it as the current user
 func handlerRegister(s *state, cmd command) error {
 	if len(cmd.args) == 0 {
 		fmt.Println("username is required")
@@ -177,6 +207,7 @@ func handlerRegister(s *state, cmd command) error {
 	return nil
 }
 
+// handlerAgg lists an RSSfeed target
 func handlerAgg(s *state, cmd command) error {
 	feedURL := "https://www.wagslane.dev/index.xml"
 
@@ -190,8 +221,53 @@ func handlerAgg(s *state, cmd command) error {
 	return nil
 }
 
-func handlerAddFeed(s *state, cmd command) error {
-	if len(cmd.args) <= 1 {
+// handlerFollowing lists the feeds a user is assigned to
+func handlerFollowing(s *state, cmd command, user database.User) error {
+	feedNames, err := s.db.GetFeedFollowsForUser(context.Background(), user.Name)
+	if err != nil {
+		return fmt.Errorf("couldn't get feeds for user: %w", err)
+	}
+
+	if len(feedNames) == 0 {
+		fmt.Println("No feeds found for the current user")
+		return nil
+	}
+
+	fmt.Printf("Feeds followed by %s:\n", user.Name)
+	for _, feedName := range feedNames {
+		if feedName.Valid {
+			fmt.Printf("- %s\n", feedName.String)
+		}
+	}
+
+	return nil
+}
+
+// handlerFollow add a user to the list of followers
+func handlerFollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) < 1 {
+		fmt.Println("feed url is required")
+		os.Exit(1)
+	}
+
+	feedURL := sql.NullString{String: cmd.args[0], Valid: true}
+
+	feed, err := s.db.GetFeed(context.Background(), feedURL)
+	if err != nil {
+		return err
+	}
+
+	cff, err := s.db.CreateFeedFollow(context.Background(), database.CreateFeedFollowParams{UserID: user.ID, FeedID: feed.ID})
+	if err != nil {
+		return err
+	}
+	fmt.Println(cff)
+	return nil
+}
+
+// handlerAddFeed adds a feed to the feeds table
+func handlerAddFeed(s *state, cmd command, user database.User) error {
+	if len(cmd.args) < 2 {
 		fmt.Println("name and url are required")
 		os.Exit(1)
 	}
@@ -199,24 +275,59 @@ func handlerAddFeed(s *state, cmd command) error {
 	n := sql.NullString{String: cmd.args[0], Valid: true}
 	u := sql.NullString{String: cmd.args[1], Valid: true}
 
-	uid, err := s.db.GetUser(context.Background(), s.conf.CurrentUserName)
-	if err != nil {
-		return err
-	}
-	feed := Feed{CreatedAt: time.Now(), UpdatedAt: time.Now(), Name: cmd.args[0], URL: cmd.args[1], UserID: uid}
-
-	err = s.db.CreateFeed(context.Background(),
+	// Create the feed and get the created feed back
+	createdFeed, err := s.db.CreateFeed(context.Background(),
 		database.CreateFeedParams{
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
 			Name:      n,
 			Url:       u,
-			UserID:    uid,
+			UserID:    user.ID,
 		})
 	if err != nil {
 		return err
 	}
-	fmt.Println(feed)
+
+	// Automatically create a feed follow for the current user
+	feedFollow, err := s.db.CreateFeedFollow(context.Background(),
+		database.CreateFeedFollowParams{
+			UserID: user.ID,
+			FeedID: createdFeed.ID,
+		})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Feed created: %s\n", createdFeed.Name.String)
+	fmt.Printf("User %s is now following %s\n", feedFollow.UserName, feedFollow.FeedName.String)
+	return nil
+}
+
+// handlerUnfollow removes a user from following a feed by its URL
+func handlerUnfollow(s *state, cmd command, user database.User) error {
+	if len(cmd.args) < 1 {
+		fmt.Println("feed url is required")
+		os.Exit(1)
+	}
+
+	feedURL := sql.NullString{String: cmd.args[0], Valid: true}
+
+	// Get the feed by URL
+	feed, err := s.db.GetFeed(context.Background(), feedURL)
+	if err != nil {
+		return fmt.Errorf("couldn't find feed with URL %s: %w", cmd.args[0], err)
+	}
+
+	// Delete the feed follow relationship
+	err = s.db.DeleteFeedFollow(context.Background(), database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't unfollow feed: %w", err)
+	}
+
+	fmt.Printf("User %s has unfollowed %s\n", user.Name, feed.Name.String)
 	return nil
 }
 
@@ -263,8 +374,11 @@ func main() {
 	c.register("reset", handlerReset)
 	c.register("users", handlerUsers)
 	c.register("agg", handlerAgg)
-	c.register("addfeed", handlerAddFeed)
+	c.register("addfeed", middlewareLoggedIn(handlerAddFeed))
 	c.register("feeds", handlerFeeds)
+	c.register("follow", middlewareLoggedIn(handlerFollow))
+	c.register("following", middlewareLoggedIn(handlerFollowing))
+	c.register("unfollow", middlewareLoggedIn(handlerUnfollow))
 
 	cmd := command{
 		name: os.Args[1],
