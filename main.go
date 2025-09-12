@@ -20,6 +20,8 @@ import (
 
 const configFileName = ".gatorconfig.json"
 
+var time_between_reqs = "10s"
+
 type state struct {
 	conf *config.Config
 	db   *database.Queries
@@ -209,6 +211,15 @@ func handlerRegister(s *state, cmd command) error {
 
 // handlerAgg lists an RSSfeed target
 func handlerAgg(s *state, cmd command) error {
+	if len(cmd.args) == 1 {
+		time_between_reqs = cmd.args[0]
+	}
+
+	t, err := time.ParseDuration(time_between_reqs)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Collecting feeds every:", t)
 	feedURL := "https://www.wagslane.dev/index.xml"
 
 	rssFeed, err := fetchFeed(context.Background(), feedURL)
@@ -351,6 +362,30 @@ func (c *commands) run(s *state, cmd command) error {
 
 func (c *commands) register(name string, f func(s *state, cmd command) error) {
 	c.handlers[name] = f
+}
+
+func scrapeFeeds(s *state) error {
+	feed, err := s.db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to get next feed: %w", err)
+	}
+
+	if err := s.db.MarkFeedFetched(context.Background(), feed.ID); err != nil {
+		return fmt.Errorf("failed to mark feed %d as fetched: %w", feed.ID, err)
+	}
+
+	// Fetch the feed content
+	feedContent, err := fetchFeed(context.Background(), feed.Url.String)
+	if err != nil {
+		return fmt.Errorf("failed to fetch feed %s: %w", feed.Url.String, err)
+	}
+
+	// Iterate over items and print titles
+	for _, item := range feedContent.Channel.Item {
+		fmt.Println(item.Title)
+	}
+
+	return nil
 }
 
 func main() {
