@@ -228,8 +228,11 @@ func handlerAgg(s *state, cmd command) error {
 	}
 
 	fmt.Println(rssFeed)
-
-	return nil
+	timeBetweenRequests, _ := time.ParseDuration(time_between_reqs)
+	ticker := time.NewTicker(timeBetweenRequests)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
 }
 
 // handlerFollowing lists the feeds a user is assigned to
