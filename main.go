@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/deoreal/gator/internal/config"
@@ -383,11 +386,111 @@ func scrapeFeeds(s *state) error {
 		return fmt.Errorf("failed to fetch feed %s: %w", feed.Url.String, err)
 	}
 
-	// Iterate over items and print titles
+	// Iterate over items and save them to database
 	for _, item := range feedContent.Channel.Item {
-		fmt.Println(item.Title)
+		// Parse the published date
+		var publishedAt sql.NullTime
+		if item.PubDate != "" {
+			// Try multiple date formats commonly used in RSS feeds
+			formats := []string{
+				time.RFC1123Z,
+				time.RFC1123,
+				"Mon, 2 Jan 2006 15:04:05 -0700",
+				"Mon, 2 Jan 2006 15:04:05 MST",
+				"2006-01-02T15:04:05Z07:00",
+				"2006-01-02T15:04:05Z",
+				"2006-01-02 15:04:05",
+			}
+
+			for _, format := range formats {
+				if parsedTime, err := time.Parse(format, item.PubDate); err == nil {
+					publishedAt = sql.NullTime{Time: parsedTime, Valid: true}
+					break
+				}
+			}
+		}
+
+		// Create post params
+		postParams := database.CreatePostParams{
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       sql.NullString{String: html.UnescapeString(item.Title), Valid: item.Title != ""},
+			Url:         item.Link,
+			Description: sql.NullString{String: html.UnescapeString(item.Description), Valid: item.Description != ""},
+			PublishedAt: publishedAt,
+			FeedID:      feed.ID,
+		}
+
+		// Try to create the post
+		_, err := s.db.CreatePost(context.Background(), postParams)
+		if err != nil {
+			// If it's a unique constraint violation (URL already exists), ignore it
+			if strings.Contains(err.Error(), "unique constraint") || strings.Contains(err.Error(), "duplicate key") {
+				continue
+			}
+			// For other errors, log them but don't stop the process
+			log.Printf("Failed to create post %s: %v", item.Link, err)
+		}
 	}
 
+	return nil
+}
+
+// handlerBrowse shows posts for the current user
+func handlerBrowse(s *state, cmd command, user database.User) error {
+	limit := int32(2) // default limit
+
+	if len(cmd.args) > 0 {
+		parsedLimit, err := strconv.Atoi(cmd.args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit: %w", err)
+		}
+		limit = int32(parsedLimit)
+	}
+
+	posts, err := s.db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  limit,
+	})
+	if err != nil {
+		return fmt.Errorf("couldn't get posts for user: %w", err)
+	}
+
+	if len(posts) == 0 {
+		fmt.Println("No posts found for the current user")
+		return nil
+	}
+
+	fmt.Printf("Posts for %s:\n", user.Name)
+	for _, post := range posts {
+		fmt.Printf("Title: %s\n", post.Title.String)
+		fmt.Printf("URL: %s\n", post.Url)
+		if post.Description.Valid {
+			// Limit description to first 100 characters for readability
+			desc := post.Description.String
+			if len(desc) > 100 {
+				desc = desc[:100] + "..."
+			}
+			fmt.Printf("Description: %s\n", desc)
+		}
+		if post.PublishedAt.Valid {
+			fmt.Printf("Published: %s\n", post.PublishedAt.Time.Format("2006-01-02 15:04:05"))
+		}
+		fmt.Printf("Feed: %s\n", post.FeedName.String)
+		fmt.Println("---")
+	}
+
+	return nil
+}
+
+// handlerScrape runs a one-time scrape of all feeds
+func handlerScrape(s *state, cmd command) error {
+	fmt.Println("Starting one-time scrape of all feeds...")
+	err := scrapeFeeds(s)
+	if err != nil {
+		return fmt.Errorf("failed to scrape feeds: %w", err)
+	}
+	fmt.Println("Scrape completed successfully!")
 	return nil
 }
 
@@ -417,6 +520,8 @@ func main() {
 	c.register("follow", middlewareLoggedIn(handlerFollow))
 	c.register("following", middlewareLoggedIn(handlerFollowing))
 	c.register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	c.register("browse", middlewareLoggedIn(handlerBrowse))
+	c.register("scrape", handlerScrape)
 
 	cmd := command{
 		name: os.Args[1],
