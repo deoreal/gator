@@ -34,6 +34,15 @@ type commands struct {
 	handlers map[string]func(*state, command) error
 }
 
+type Feed struct {
+	ID        int       `json:"title"`
+	CreatedAt time.Time `json:"create_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Name      string    `json:"name"`
+	URL       string    `json:"url"`
+	UserID    uuid.UUID `json:"user_id"`
+}
+
 type RSSFeed struct {
 	Channel struct {
 		Title       string    `xml:"title"`
@@ -115,6 +124,15 @@ func handlerLogin(s *state, cmd command) error {
 	return nil
 }
 
+func handlerFeeds(s *state, cmd command) error {
+	feeds, err := s.db.GetFeeds(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Println(feeds)
+	return nil
+}
+
 func handlerUsers(s *state, cmd command) error {
 	users, err := s.db.GetUsers(context.Background())
 	if err != nil {
@@ -172,6 +190,36 @@ func handlerAgg(s *state, cmd command) error {
 	return nil
 }
 
+func handlerAddFeed(s *state, cmd command) error {
+	if len(cmd.args) <= 1 {
+		fmt.Println("name and url are required")
+		os.Exit(1)
+	}
+
+	n := sql.NullString{String: cmd.args[0], Valid: true}
+	u := sql.NullString{String: cmd.args[1], Valid: true}
+
+	uid, err := s.db.GetUser(context.Background(), s.conf.CurrentUserName)
+	if err != nil {
+		return err
+	}
+	feed := Feed{CreatedAt: time.Now(), UpdatedAt: time.Now(), Name: cmd.args[0], URL: cmd.args[1], UserID: uid}
+
+	err = s.db.CreateFeed(context.Background(),
+		database.CreateFeedParams{
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+			Name:      n,
+			Url:       u,
+			UserID:    uid,
+		})
+	if err != nil {
+		return err
+	}
+	fmt.Println(feed)
+	return nil
+}
+
 func handlerReset(s *state, cmd command) error {
 	err := s.db.Reset(context.Background())
 	if err != nil {
@@ -215,6 +263,8 @@ func main() {
 	c.register("reset", handlerReset)
 	c.register("users", handlerUsers)
 	c.register("agg", handlerAgg)
+	c.register("addfeed", handlerAddFeed)
+	c.register("feeds", handlerFeeds)
 
 	cmd := command{
 		name: os.Args[1],
